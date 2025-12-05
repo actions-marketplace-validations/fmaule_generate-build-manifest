@@ -9,23 +9,46 @@ import {
   WorkflowDispatchEvent,
 } from "@octokit/webhooks-definitions/schema";
 
-const getBool = (input: string): boolean => (input === "on" ? true : false);
+// first we attempt to read the file from the path provided, if not found, we try to search in the GITHUB_WORKSPACE
+const getFilePath = (filePath: string) => {
+  let fileLocation = filePath;
 
-const getPackageInfo = (): Package => {
-  const packageJsonLocation = `${process.env.GITHUB_WORKSPACE}/package.json`;
-  const packageJson = require(packageJsonLocation);
-  const { name, version } = packageJson;
+  if (!fs.existsSync(fileLocation)) {
+    core.warning(
+      `${fileLocation} not found, searching in the GITHUB_WORKSPACE ${process.env.GITHUB_WORKSPACE}`,
+    );
+    fileLocation = `${process.env.GITHUB_WORKSPACE}/${filePath}`;
+  }
+  if (!fs.existsSync(fileLocation)) {
+    throw new Error(
+      `${filePath} not found in ${fileLocation}. Make sure you have one or turn off the append-dockerfile option if not needed (see README)`,
+    );
+  }
+
+  // file is found, return the path
+  return fileLocation;
+};
+
+const getPackageInfo = (packageJson: string): Package => {
+  const packageJsonLocation = getFilePath(packageJson);
+
+  const packageJsonContent = fs.readFileSync(packageJsonLocation, "utf-8");
+  const { name, version } = JSON.parse(packageJsonContent);
   return { name, version };
 };
 
 const getActionInfo = (): { ghAction: ActionInfo } => {
   const workflow = process.env.GITHUB_WORKFLOW;
+  const runNumber = process.env.GITHUB_RUN_NUMBER
+    ? parseInt(process.env.GITHUB_RUN_NUMBER, 10)
+    : undefined;
   const runnerArch = process.env.RUNNER_ARCH;
   const runnerName = process.env.RUNNER_NAME;
   const runnerOs = process.env.RUNNER_OS;
 
   const ghAction = {
     workflow,
+    runNumber,
     runner: {
       arch: runnerArch,
       name: runnerName,
@@ -51,6 +74,9 @@ const getScm = (): { scm: SCM | null } => {
   const { sha, ref } = context;
   const { ssh_url, clone_url } = repository;
 
+  // "sha-1234567" is what you get by default by the official docker/metadata-action
+  const short_sha = `sha-${sha.slice(0, 7)}`;
+
   const branch = process.env.GITHUB_REF_NAME;
 
   const scm = {
@@ -59,19 +85,21 @@ const getScm = (): { scm: SCM | null } => {
     clone_url,
     branch,
     sha,
+    short_sha,
     ref,
   };
 
   return { scm };
 };
 
-const writeDockerFile = (manifestName: string) => {
+const writeDockerFile = (dockerfile: string, manifestName: string) => {
   const dockerCommand = `\nCOPY ${manifestName} ./\n`;
-  const dockerFile = `${process.env.GITHUB_WORKSPACE}/Dockerfile`;
+
+  const dockerFilePath = getFilePath(dockerfile);
   core.debug(
-    `Appending command to docker file (${dockerFile}): ${dockerCommand}`,
+    `Appending command to docker file (${dockerFilePath}): ${dockerCommand}`,
   );
-  fs.appendFileSync(dockerFile, dockerCommand);
+  fs.appendFileSync(dockerFilePath, dockerCommand);
 };
 
 try {
@@ -81,6 +109,8 @@ try {
   const writeScm = core.getBooleanInput("scm-info");
   const writePackageInfo = core.getBooleanInput("package-info");
   const writeActionInfo = core.getBooleanInput("action-info");
+  const packageJson = core.getInput("package-json");
+  const dockerFile = core.getInput("dockerfile");
   const appendDockerFile = core.getBooleanInput("append-dockerfile");
   const manifestFile = core.getInput("manifest-file");
 
@@ -93,25 +123,22 @@ try {
   const manifest: Manifest = {
     timestamp,
     ...(writeScm && getScm()),
-    ...(writePackageInfo && getPackageInfo()),
+    ...(writePackageInfo && getPackageInfo(packageJson)),
     ...(writeActionInfo && getActionInfo()),
   };
 
-  fs.writeFileSync(
-    manifestFile,
-    `${JSON.stringify(manifest, null, 2)}\n`,
-    "utf-8",
-  );
+  const manifestContent = `${JSON.stringify(manifest, null, 2)}\n`;
+  fs.writeFileSync(manifestFile, manifestContent, "utf-8");
 
   if (appendDockerFile) {
-    writeDockerFile(manifestFile);
+    writeDockerFile(dockerFile, manifestFile);
   }
 
   appendDockerFile
-    ? core.info(
-        `📝 Manifest: ${manifestFile} + COPY to Dockerfile sadfaskfkdsfadsfasdfsda`,
-      )
-    : core.info(`📝 Manifest: ${manifestFile} asdfsdafsdfsafdafdfdas`);
+    ? core.info(`📝 Manifest: ${manifestFile} + COPY to Dockerfile`)
+    : core.info(`📝 Manifest: ${manifestFile}`);
+
+  core.setOutput("manifest-content", manifestContent);
 } catch (e) {
   core.error(e as Error);
   core.setFailed((e as Error).message);
